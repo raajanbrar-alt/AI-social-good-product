@@ -1,0 +1,1511 @@
+"""
+food_sorter_prototype.py
+========================
+Prototype food sorting machine — decision engine + simulated hardware layer.
+
+This file is a self-contained, runnable prototype. Every section has inline
+comments explaining exactly what each line or block does and why.
+
+Run it directly:
+    python food_sorter_prototype.py
+
+What it simulates:
+  - A conveyor belt feeding items one at a time into the sort engine
+  - IR temperature sensor readings (simulated with random noise)
+  - The full 4-criterion decision pipeline
+  - Hardware driver calls (printed as actions the real drivers would execute)
+  - A live summary dashboard printed to the terminal after each batch
+
+Sections in this file:
+  1.  Imports & logging setup
+  2.  Enumerations  (Bin, Action, Region)
+  3.  Data structures  (TemperatureRange, FoodProfile)
+  4.  Food catalog  (FOOD_CATALOG)
+  5.  Incoming sample dataclass  (FoodSample)
+  6.  Sort decision dataclass  (SortDecision)
+  6b. Food condition assessment  (FoodCondition, assess_food_condition)
+  7.  Criterion scoring helpers
+  8.  Edge-case handlers
+  9.  Core sort function  (sort_item)
+  10. Batch sort utility  (sort_batch)
+  11. Simulated hardware driver layer
+  12. Simulated sensor / conveyor feed
+  13. Dashboard / summary printer
+  14. Main entry point
+"""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1 — IMPORTS & LOGGING SETUP
+# ─────────────────────────────────────────────────────────────────────────────
+
+from __future__ import annotations          # allows forward references in type hints
+
+import logging                              # standard library logger — no third-party needed
+import random                               # used by the simulated sensor to add measurement noise
+import time                                 # used to simulate belt timing delays
+from dataclasses import dataclass, field    # @dataclass decorator + field() for mutable defaults
+from enum import Enum                       # Enum base class for type-safe constants
+from typing import Optional                 # Optional[X] = X | None, needed for Python < 3.10
+
+# Configure the root logger: show INFO and above, prepend level name
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)-8s | %(message)s"  # left-aligned 8-char level name, then message
+)
+logger = logging.getLogger(__name__)        # module-level logger; name = "food_sorter_prototype"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 2 — ENUMERATIONS
+# ─────────────────────────────────────────────────────────────────────────────
+# Why Enums instead of plain strings?
+#   • IDE autocomplete catches typos at write-time, not runtime.
+#   • Comparing Bin.FREEZER == "freezer_unit" works because Bin inherits str.
+#   • Hardware driver code can switch on the enum value cleanly.
+
+class Bin(str, Enum):
+    """Physical destination bins/compartments on the sorting machine."""
+    REFRIGERATION = "refrigeration_unit"    # 0–4 °C chilled storage
+    FREEZER       = "freezer_unit"          # below -12 °C frozen storage
+    DRY_STORAGE   = "dry_storage"           # room temp, low humidity shelf
+    AMBIENT_BIN   = "ambient_bin"           # room temp general bin
+    TROPICAL_BIN  = "tropical_bin"          # warm (13–25 °C) climate-controlled
+    QUARANTINE    = "quarantine_bin"        # holds items the engine can't confidently classify
+    REJECT        = "reject_chute"          # unsafe / expired — removed from food chain
+
+
+class Action(str, Enum):
+    """Physical commands sent to the machine's hardware drivers."""
+    DIVERT_LANE  = "divert_lane"            # flip a pneumatic gate to redirect the belt lane
+    CONVEYOR_STOP = "conveyor_stop"         # halt the belt so a precise pick can happen
+    ROBOTIC_ARM  = "robotic_arm_trigger"    # trigger a full pick-and-place robotic cycle
+    REJECT_CHUTE = "reject_chute_open"      # open a trapdoor and drop the item into reject
+
+
+class Region(str, Enum):
+    """Environmental/geographic profiles that affect long-term food suitability."""
+    TROPICAL  = "tropical"                  # high humidity (>70 %), avg temp >25 °C
+    TEMPERATE = "temperate"                 # moderate humidity, 10–20 °C average
+    ARID      = "arid"                      # low humidity (<30 %), variable temperature
+    ARCTIC    = "arctic"                    # very low temperature, low humidity
+    HIGHLAND  = "highland"                  # high altitude, low atmospheric pressure
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 3 — DATA STRUCTURES
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)     # frozen=True makes the instance immutable (like a named tuple)
+class TemperatureRange:
+    """
+    Represents the safe ambient storage temperature window for a food type.
+    All temperatures are in degrees Celsius.
+    """
+    min_c: float            # lowest safe temperature (inclusive)
+    max_c: float            # highest safe temperature (inclusive)
+
+    def contains(self, temp: float) -> bool:
+        """Return True if `temp` is within the safe window."""
+        return self.min_c <= temp <= self.max_c
+
+    def is_borderline(self, temp: float, tolerance: float = 2.0) -> bool:
+        """
+        Return True when the temperature is inside the safe range but
+        within `tolerance` °C of either boundary.
+        A borderline reading is not an immediate reject, but it signals
+        the engine to prefer a safer secondary bin and reduce confidence.
+        Default tolerance is ±2 °C — typical IR sensor measurement noise.
+        """
+        if not self.contains(temp):
+            return False                    # outside range entirely — not borderline, just unsafe
+        return (
+            abs(temp - self.min_c) <= tolerance or
+            abs(temp - self.max_c) <= tolerance
+        )
+
+
+@dataclass(frozen=True)     # frozen so catalog data can never be accidentally mutated at runtime
+class FoodProfile:
+    """
+    Immutable descriptor for a class of food items.
+    One FoodProfile exists per food type in FOOD_CATALOG.
+
+    Fields
+    ------
+    name                : display label used in log output
+    safe_temp_range     : the only temperatures where storage is safe
+    shelf_life_hours    : hours to spoilage under ideal conditions
+    perishability       : 1 (very stable) → 10 (spoils within hours)
+                          used to compute routing urgency
+    allowed_bins        : tuple of Bin values in preference order
+                          (most preferred first)
+    regional_scores     : dict mapping Region → float 0.0–1.0
+                          1.0 = ideal conditions, 0.0 = unsuitable
+    requires_robotic_arm: True for fragile or awkwardly shaped items
+                          that cannot be passively diverted without damage
+    """
+    name:                 str
+    safe_temp_range:      TemperatureRange
+    shelf_life_hours:     float
+    perishability:        int                   # must be 1–10
+    allowed_bins:         tuple[Bin, ...]       # non-empty, ordered
+    regional_scores:      dict[Region, float]   # all five Region keys expected
+    requires_robotic_arm: bool = False          # default False — most items can be diverted
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 4 — FOOD CATALOG
+# ─────────────────────────────────────────────────────────────────────────────
+# FOOD_CATALOG is the single source of truth for every food type the machine
+# can process. In production this would be loaded from a database or YAML/JSON
+# config file — the FoodProfile structure stays identical either way.
+#
+# Keys are lowercase strings matching what the upstream vision/barcode system
+# sends. Values are frozen FoodProfile instances.
+
+FOOD_CATALOG: dict[str, FoodProfile] = {
+
+    # ── Strawberry ────────────────────────────────────────────────────────
+    # Fragile soft fruit; narrow cold window; high perishability.
+    # Requires robotic arm because passive diversion crushes the fruit.
+    "strawberry": FoodProfile(
+        name="strawberry",
+        safe_temp_range=TemperatureRange(0.0, 4.0),    # chilled, just above freezing
+        shelf_life_hours=72,                            # 3 days ideal
+        perishability=9,                                # spoils fast
+        allowed_bins=(Bin.REFRIGERATION, Bin.FREEZER),  # freezer only if refrigeration full
+        regional_scores={
+            Region.TEMPERATE: 1.0,  # ideal — mild humidity, moderate temp
+            Region.TROPICAL:  0.4,  # high humidity accelerates mould
+            Region.ARID:      0.5,  # low humidity dries the fruit out
+            Region.ARCTIC:    0.7,  # cold helps but transport risk high
+            Region.HIGHLAND:  0.8,  # cool and relatively dry — good
+        },
+        requires_robotic_arm=True,  # fragile; divert lane would bruise it
+    ),
+
+    # ── Banana ───────────────────────────────────────────────────────────
+    # Tropical fruit; sensitive to cold (chilling injury below 13 °C);
+    # does NOT go in refrigeration — it blackens.
+    "banana": FoodProfile(
+        name="banana",
+        safe_temp_range=TemperatureRange(13.0, 22.0),  # warm storage required
+        shelf_life_hours=96,                            # 4 days
+        perishability=7,
+        allowed_bins=(Bin.TROPICAL_BIN, Bin.AMBIENT_BIN),  # no cold storage allowed
+        regional_scores={
+            Region.TROPICAL:  1.0,
+            Region.TEMPERATE: 0.7,
+            Region.ARID:      0.5,
+            Region.ARCTIC:    0.1,  # very poor — chilling injury almost certain
+            Region.HIGHLAND:  0.6,
+        },
+        requires_robotic_arm=False,  # robust skin — lane divert is fine
+    ),
+
+    # ── Chicken breast ────────────────────────────────────────────────────
+    # Raw poultry; highest food-safety risk category; perishability 10.
+    # Must reach cold storage immediately; robotic arm for hygiene precision.
+    "chicken_breast": FoodProfile(
+        name="chicken_breast",
+        safe_temp_range=TemperatureRange(-2.0, 4.0),   # near-freezing required
+        shelf_life_hours=48,                            # 2 days max
+        perishability=10,                               # maximum urgency
+        allowed_bins=(Bin.REFRIGERATION, Bin.FREEZER),
+        regional_scores={
+            Region.TEMPERATE: 0.8,
+            Region.TROPICAL:  0.3,  # ambient humidity dramatically shortens life
+            Region.ARID:      0.5,
+            Region.ARCTIC:    0.9,  # naturally cold — excellent
+            Region.HIGHLAND:  0.7,
+        },
+        requires_robotic_arm=True,  # hygienic precise placement required
+    ),
+
+    # ── Canned beans ─────────────────────────────────────────────────────
+    # Shelf-stable processed food; ~5 year shelf life.
+    # Perishability 1 — lowest urgency; can queue freely.
+    "canned_beans": FoodProfile(
+        name="canned_beans",
+        safe_temp_range=TemperatureRange(10.0, 30.0),  # wide safe window
+        shelf_life_hours=43800,                         # ~5 years
+        perishability=1,                                # extremely stable
+        allowed_bins=(Bin.DRY_STORAGE, Bin.AMBIENT_BIN),
+        regional_scores={
+            Region.TEMPERATE: 1.0,
+            Region.TROPICAL:  0.8,  # humidity can rust the can exterior
+            Region.ARID:      0.9,
+            Region.ARCTIC:    0.7,
+            Region.HIGHLAND:  0.9,
+        },
+        requires_robotic_arm=False,  # sturdy metal can — lane divert fine
+    ),
+
+    # ── Ice cream ─────────────────────────────────────────────────────────
+    # Deep-frozen product; only destination is the freezer.
+    # Temperature range is deliberately narrow and very cold.
+    "ice_cream": FoodProfile(
+        name="ice_cream",
+        safe_temp_range=TemperatureRange(-30.0, -12.0),    # must stay frozen hard
+        shelf_life_hours=4380,                              # ~6 months
+        perishability=8,
+        allowed_bins=(Bin.FREEZER,),                        # only one valid destination
+        regional_scores={
+            Region.ARCTIC:    1.0,
+            Region.HIGHLAND:  0.7,
+            Region.TEMPERATE: 0.6,
+            Region.ARID:      0.4,
+            Region.TROPICAL:  0.2,  # ambient heat makes freezer work much harder
+        },
+        requires_robotic_arm=False,
+    ),
+
+    # ── Mango ─────────────────────────────────────────────────────────────
+    # Tropical stone fruit; fragile skin bruises easily.
+    # Can tolerate refrigeration short-term but prefers warm storage.
+    "mango": FoodProfile(
+        name="mango",
+        safe_temp_range=TemperatureRange(10.0, 25.0),
+        shelf_life_hours=120,   # 5 days
+        perishability=7,
+        allowed_bins=(Bin.TROPICAL_BIN, Bin.AMBIENT_BIN, Bin.REFRIGERATION),
+        regional_scores={
+            Region.TROPICAL:  1.0,
+            Region.TEMPERATE: 0.7,
+            Region.ARID:      0.6,
+            Region.ARCTIC:    0.2,
+            Region.HIGHLAND:  0.5,
+        },
+        requires_robotic_arm=True,  # thin skin bruises on divert gate impact
+    ),
+
+    # ── Whole milk ────────────────────────────────────────────────────────
+    # Pasteurised dairy; cold chain critical; only goes to refrigeration.
+    "whole_milk": FoodProfile(
+        name="whole_milk",
+        safe_temp_range=TemperatureRange(1.0, 4.0),    # narrow cold window
+        shelf_life_hours=168,                           # 7 days
+        perishability=8,
+        allowed_bins=(Bin.REFRIGERATION,),              # single allowed destination
+        regional_scores={
+            Region.TEMPERATE: 1.0,
+            Region.ARCTIC:    0.9,
+            Region.HIGHLAND:  0.8,
+            Region.ARID:      0.5,
+            Region.TROPICAL:  0.3,
+        },
+        requires_robotic_arm=False,  # carton is robust enough for lane divert
+    ),
+
+    # ── Flour ─────────────────────────────────────────────────────────────
+    # Dry pantry staple; sensitive to moisture, not to temperature.
+    # ~1 year shelf life; lowest urgency after canned goods.
+    "flour": FoodProfile(
+        name="flour",
+        safe_temp_range=TemperatureRange(10.0, 25.0),
+        shelf_life_hours=8760,  # ~1 year
+        perishability=2,
+        allowed_bins=(Bin.DRY_STORAGE,),
+        regional_scores={
+            Region.ARID:      1.0,  # dry climate is ideal — no moisture absorption
+            Region.TEMPERATE: 0.9,
+            Region.HIGHLAND:  0.8,
+            Region.ARCTIC:    0.7,
+            Region.TROPICAL:  0.5,  # high humidity causes clumping and mould
+        },
+        requires_robotic_arm=False,
+    ),
+
+    # ── Salmon fillet ─────────────────────────────────────────────────────
+    # Fresh raw fish; among the most time-critical items on the line.
+    # 36 h shelf life; perishability 10 like chicken.
+    "salmon_fillet": FoodProfile(
+        name="salmon_fillet",
+        safe_temp_range=TemperatureRange(-2.0, 2.0),   # very tight cold window
+        shelf_life_hours=36,
+        perishability=10,
+        allowed_bins=(Bin.REFRIGERATION, Bin.FREEZER),
+        regional_scores={
+            Region.ARCTIC:    1.0,
+            Region.TEMPERATE: 0.7,
+            Region.HIGHLAND:  0.5,
+            Region.ARID:      0.3,
+            Region.TROPICAL:  0.2,
+        },
+        requires_robotic_arm=True,  # delicate flesh — precise placement needed
+    ),
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5 — INCOMING SAMPLE DATACLASS
+# ─────────────────────────────────────────────────────────────────────────────
+# FoodSample is the input contract between the hardware/sensor layer and
+# this sorting engine. Every item arriving on the intake belt must be
+# described as a FoodSample before sort_item() is called.
+#
+# In a real system the vision pipeline, barcode scanner, and IR sensor
+# populate these fields automatically. In this prototype, the simulated
+# sensor layer in Section 12 generates them.
+
+@dataclass
+class FoodSample:
+    """
+    Represents a single food item arriving on the intake conveyor.
+
+    Parameters
+    ----------
+    food_type           : key into FOOD_CATALOG — must match exactly
+                          (e.g. "strawberry", "chicken_breast")
+    measured_temp_c     : surface temperature from IR sensor in °C
+    current_region      : Region enum for this facility's environment
+    hours_since_harvest : hours elapsed since harvest / production date
+                          (read from package label or RFID tag)
+    item_id             : unique identifier for traceability (barcode / RFID)
+    """
+    food_type:           str
+    measured_temp_c:     float
+    current_region:      Region
+    hours_since_harvest: float
+    item_id:             str = "UNKNOWN"    # default for unlabelled items
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6 — SORT DECISION DATACLASS
+# ─────────────────────────────────────────────────────────────────────────────
+# SortDecision is the output contract — what sort_item() returns.
+# Hardware drivers only need .destination and .action.
+# Everything else supports monitoring, logging, and operator alerts.
+
+@dataclass
+class SortDecision:
+    """
+    Complete routing decision returned by sort_item().
+
+    Fields
+    ------
+    item_id     : echoed from FoodSample — links the decision to a physical item
+    destination : Bin enum — which bin/compartment to send the item to
+    action      : Action enum — which physical mechanism to trigger
+    priority    : 1 (lowest urgency) → 10 (must route immediately)
+                  used by the belt controller to schedule execution order
+    confidence  : 0.0–1.0 composite score across all four criteria
+                  values below 0.40 are overridden to QUARANTINE
+    reason      : human-readable explanation of why this decision was made
+                  (for operator display and audit logs)
+    warnings    : list of non-fatal issues that reduced confidence
+                  (empty list = clean sort with no concerns)
+    """
+    item_id:     str
+    destination: Bin
+    action:      Action
+    priority:    int            # 1–10
+    confidence:  float          # 0.0–1.0
+    reason:      str
+    condition:   "FoodCondition" = None   # set by assess_food_condition() after sort_item()
+    warnings:    list[str] = field(default_factory=list)    # mutable default needs field()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 6b — FOOD CONDITION ASSESSMENT
+# ─────────────────────────────────────────────────────────────────────────────
+# This section answers the plain question an operator wants to see on screen:
+# "Is this item GOOD, EXPIRING SOON, or BAD?"
+#
+# It is deliberately separate from the sort decision engine because condition
+# is a human-facing label, not a routing criterion. The sort engine already
+# makes routing decisions based on raw numeric scores; this section translates
+# those numbers into a clear, colour-coded status for display on operator
+# terminals, SCADA dashboards, and printed labels.
+#
+# Three inputs drive the condition label:
+#   1. remaining_fraction  — how much of the shelf life is left (0.0–1.0)
+#   2. temp_ok             — whether the current temperature is in the safe range
+#   3. destination         — if the sort engine already sent it to REJECT,
+#                            the condition is always BAD regardless of freshness
+#
+# The five condition levels, from best to worst:
+#   GOOD          → >60 % shelf life remaining, safe temperature
+#   USE_SOON      → 30–60 % remaining — still fine but use before new stock
+#   EXPIRING_SOON → 10–30 % remaining — elevated urgency, consume or freeze now
+#   CRITICAL      → <10 % remaining OR borderline temperature — last chance
+#   BAD           → expired, unsafe temperature, or already rejected
+
+class FoodCondition(str, Enum):
+    """
+    Human-readable quality label for a food item.
+    Each level maps to a clear operator message and a suggested action.
+    """
+    GOOD          = "GOOD"           # fresh, plenty of life left, safe temp
+    USE_SOON      = "USE SOON"       # aging but still fully safe, prioritise use
+    EXPIRING_SOON = "EXPIRING SOON"  # approaching end of life — escalate handling
+    CRITICAL      = "CRITICAL"       # very little life left or borderline temp
+    BAD           = "BAD"            # expired, unsafe temp, or already rejected
+
+
+# Recommended operator action for each condition level.
+# This is printed in the dashboard and can be relayed to warehouse staff.
+CONDITION_ACTIONS: dict[FoodCondition, str] = {
+    FoodCondition.GOOD:          "Store normally. No special handling required.",
+    FoodCondition.USE_SOON:      "Place at front of storage. Use before newer stock.",
+    FoodCondition.EXPIRING_SOON: "Route to high-turnover zone. Flag for rapid dispatch.",
+    FoodCondition.CRITICAL:      "Use immediately or freeze if applicable. Alert supervisor.",
+    FoodCondition.BAD:           "Remove from food chain. Log and dispose per protocol.",
+}
+
+# Terminal display symbols used in the dashboard — one character per level.
+CONDITION_SYMBOLS: dict[FoodCondition, str] = {
+    FoodCondition.GOOD:          "✔",   # green check
+    FoodCondition.USE_SOON:      "→",   # neutral arrow
+    FoodCondition.EXPIRING_SOON: "⚠",   # warning triangle
+    FoodCondition.CRITICAL:      "!!",  # double exclamation
+    FoodCondition.BAD:           "✘",   # red cross
+}
+
+
+def assess_food_condition(
+    sample:             FoodSample,
+    remaining_fraction: float,      # output of _score_perishability: 0.0–1.0
+    temp_score:         float,      # output of _score_temperature: 0.0, 0.5, or 1.0
+    destination:        Bin,        # final routed destination from sort_item()
+) -> tuple[FoodCondition, str]:
+    """
+    Classify the food item's condition into one of five human-readable levels.
+
+    This function is called inside sort_item() after all scoring is complete,
+    so it has access to every computed value. It does NOT change any routing
+    decision — it only attaches a label for operator display.
+
+    Parameters
+    ----------
+    sample             : the original FoodSample (used for item_id in log output)
+    remaining_fraction : fraction of shelf life remaining (1.0 = brand new,
+                         0.0 = exactly at expiry, <0 clamped to 0)
+    temp_score         : temperature score from _score_temperature()
+                         1.0 = safe | 0.5 = borderline | 0.0 = unsafe/rejected
+    destination        : the bin the engine has already chosen for this item
+
+    Returns
+    -------
+    condition   : FoodCondition enum value
+    description : one-sentence plain-English description for display
+    """
+
+    # ── Rule 1: Already rejected → always BAD ─────────────────────────────
+    # If the sort engine sent the item to the reject chute, the condition is
+    # definitively BAD. This covers both expired items (remaining_fraction = 0)
+    # and unsafe temperature items (temp_score = 0.0). No further checks needed.
+    if destination == Bin.REJECT:
+        if remaining_fraction <= 0.0:
+            desc = (
+                f"Item has exceeded its shelf life "
+                f"({sample.hours_since_harvest:.1f} h elapsed). "
+                f"Must be removed from the food chain."
+            )
+        else:
+            desc = (
+                f"Item is at an unsafe temperature and has been rejected. "
+                f"May have partially spoiled — do not consume."
+            )
+        return FoodCondition.BAD, desc
+
+    # ── Rule 2: Unsafe temperature (not yet expired) → BAD ────────────────
+    # temp_score 0.0 means the temperature reading is fully outside the safe
+    # window. Even if the item is fresh, temperature abuse may have already
+    # begun microbial growth — classify as BAD.
+    if temp_score == 0.0:
+        desc = (
+            f"Temperature reading is outside the safe storage range. "
+            f"Potential spoilage regardless of freshness — treat as BAD."
+        )
+        return FoodCondition.BAD, desc
+
+    # ── Rule 3: Shelf life already gone → BAD ─────────────────────────────
+    # remaining_fraction <= 0 means hours_since_harvest >= shelf_life_hours.
+    # This duplicates the reject check only as a safety net in case condition
+    # is assessed on a quarantined item that is also expired.
+    if remaining_fraction <= 0.0:
+        desc = (
+            f"Shelf life fully consumed. Item is expired and must be discarded."
+        )
+        return FoodCondition.BAD, desc
+
+    # ── Rule 4: Borderline temperature + low remaining life → CRITICAL ─────
+    # When temp_score is 0.5 (borderline) AND less than 20 % of shelf life
+    # remains, the combination is critical: temperature stress on an already
+    # aging item dramatically accelerates spoilage. Flag immediately.
+    if temp_score == 0.5 and remaining_fraction < 0.20:
+        pct = round(remaining_fraction * 100)
+        desc = (
+            f"Borderline temperature combined with only {pct} % shelf life remaining. "
+            f"High spoilage risk — consume or freeze immediately."
+        )
+        return FoodCondition.CRITICAL, desc
+
+    # ── Rule 5: Very little shelf life left → CRITICAL ────────────────────
+    # Less than 10 % remaining regardless of temperature.
+    # "10 %" is the threshold because at this level even a minor temperature
+    # fluctuation or handling delay could push the item over the edge.
+    if remaining_fraction < 0.10:
+        pct = round(remaining_fraction * 100)
+        desc = (
+            f"Only {pct} % of shelf life remaining. "
+            f"Item is in critical condition — use immediately or discard."
+        )
+        return FoodCondition.CRITICAL, desc
+
+    # ── Rule 6: Approaching end of life → EXPIRING SOON ──────────────────
+    # 10–30 % shelf life remaining. The item is still safe to consume but
+    # should be prioritised over fresher stock to avoid waste.
+    if remaining_fraction < 0.30:
+        pct = round(remaining_fraction * 100)
+        desc = (
+            f"{pct} % of shelf life remaining. "
+            f"Expiring soon — prioritise for immediate use or dispatch."
+        )
+        return FoodCondition.EXPIRING_SOON, desc
+
+    # ── Rule 7: Borderline temperature but still fresh → EXPIRING SOON ────
+    # Even with plenty of time left, a borderline temperature reading is a
+    # yellow flag — storage conditions are marginal and the item should be
+    # monitored and used before other stock. Classify as EXPIRING_SOON rather
+    # than USE_SOON to elevate the urgency signal.
+    if temp_score == 0.5:
+        pct = round(remaining_fraction * 100)
+        desc = (
+            f"Temperature is near the safe-range boundary. "
+            f"{pct} % shelf life remains, but temperature stress may shorten it. "
+            f"Prioritise use."
+        )
+        return FoodCondition.EXPIRING_SOON, desc
+
+    # ── Rule 8: Aging but still fully safe → USE SOON ─────────────────────
+    # 30–60 % shelf life remaining, temperature fully safe.
+    # Item is in normal mid-cycle condition. No alarm, but it should be
+    # consumed before newer stock to maintain FIFO rotation.
+    if remaining_fraction < 0.60:
+        pct = round(remaining_fraction * 100)
+        days_left = round((remaining_fraction * _get_shelf_hours(sample)) / 24, 1)
+        desc = (
+            f"{pct} % of shelf life remaining (~{days_left} days). "
+            f"Item is safe — place at front of storage for FIFO rotation."
+        )
+        return FoodCondition.USE_SOON, desc
+
+    # ── Rule 9: Fresh and safe → GOOD ─────────────────────────────────────
+    # More than 60 % of shelf life remaining and temperature fully within range.
+    # This is the ideal case — no special handling required.
+    pct = round(remaining_fraction * 100)
+    days_left = round((remaining_fraction * _get_shelf_hours(sample)) / 24, 1)
+    desc = (
+        f"{pct} % of shelf life remaining (~{days_left} days). "
+        f"Item is fresh and in good condition. Store normally."
+    )
+    return FoodCondition.GOOD, desc
+
+
+def _get_shelf_hours(sample: FoodSample) -> float:
+    """
+    Helper: look up the shelf_life_hours for a sample's food type.
+    Returns 0 if the food type is not in the catalog (unknown item).
+    Used only for display calculations inside assess_food_condition().
+    """
+    profile = FOOD_CATALOG.get(sample.food_type.lower().strip())
+    return profile.shelf_life_hours if profile else 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7 — CRITERION SCORING HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+# One function per sorting criterion. Each returns a numeric score
+# (0.0–1.0) plus a list of any warnings generated.
+# The weights below control how much each criterion contributes to
+# the final composite confidence score.
+
+# Weights must sum to 1.0
+# Temperature is highest because it is a food-safety hard constraint.
+# Destination compatibility is second — wrong bin = food lost or wasted.
+# Perishability drives urgency scheduling more than confidence.
+# Regional suitability is advisory — it informs long-term rationing decisions.
+CRITERION_WEIGHTS = {
+    "temperature":   0.35,  # primary food-safety dimension
+    "destination":   0.30,  # compatibility with available bins
+    "perishability": 0.20,  # freshness / remaining shelf life
+    "regional":      0.15,  # environmental suitability (advisory)
+}
+
+
+def _score_temperature(profile: FoodProfile, temp: float) -> tuple[float, list[str]]:
+    """
+    Evaluate measured temperature against the food's safe range.
+
+    Returns
+    -------
+    score : 1.0 = comfortably within range
+            0.5 = borderline (within ±2 °C of a boundary)
+            0.0 = outside range — triggers REJECT regardless of other scores
+    warnings : list of strings describing any issues found
+    """
+    warnings: list[str] = []
+
+    if not profile.safe_temp_range.contains(temp):
+        # Temperature is outside the safe window — hard food-safety failure.
+        # This check happens before the borderline check because contains()
+        # must be True for is_borderline() to be meaningful.
+        warnings.append(
+            f"Temperature {temp:.1f} °C is OUTSIDE safe range "
+            f"[{profile.safe_temp_range.min_c}, {profile.safe_temp_range.max_c}] °C"
+        )
+        return 0.0, warnings
+
+    if profile.safe_temp_range.is_borderline(temp):
+        # Temperature is technically safe but close to a boundary.
+        # Score 0.5 tells the bin selector to prefer a safer fallback bin
+        # and lowers the composite confidence.
+        warnings.append(
+            f"Temperature {temp:.1f} °C is borderline near range boundary "
+            f"[{profile.safe_temp_range.min_c}, {profile.safe_temp_range.max_c}] °C"
+        )
+        return 0.5, warnings
+
+    # Temperature is safely within range — full score, no warnings.
+    return 1.0, warnings
+
+
+def _score_perishability(
+    profile: FoodProfile,
+    hours_since_harvest: float,
+) -> tuple[float, int, list[str]]:
+    """
+    Evaluate how much of the item's shelf life has already elapsed.
+
+    Returns
+    -------
+    freshness_score : 0.0 (expired) → 1.0 (just harvested)
+    urgency         : 1–10 priority for belt scheduling
+                      high perishability + little life left = 10
+    warnings        : list of any shelf-life alerts
+    """
+    warnings: list[str] = []
+
+    # Guard against bad catalog data — shelf life of 0 would cause division by zero.
+    if profile.shelf_life_hours <= 0:
+        return 0.0, 10, ["Invalid shelf_life_hours in catalog (≤ 0) — treated as expired"]
+
+    # remaining_fraction: 1.0 = just harvested, 0.0 = at exactly the shelf life limit
+    # max(..., 0.0) clamps negative values — an item past its limit gets fraction = 0.
+    remaining_fraction = max(0.0, 1.0 - (hours_since_harvest / profile.shelf_life_hours))
+
+    if remaining_fraction == 0.0:
+        # Item has hit or exceeded its shelf life — the caller will reject it.
+        warnings.append(
+            f"Item has used {hours_since_harvest:.1f} h of "
+            f"{profile.shelf_life_hours:.1f} h shelf life — EXPIRED"
+        )
+
+    # urgency_priority formula:
+    #   • Start at base 1 (minimum urgency).
+    #   • Add (perishability × fraction of life already consumed).
+    #   • A chicken breast (perishability=10) at 90% elapsed → raw ≈ 10, priority 10.
+    #   • Canned beans (perishability=1) at 1% elapsed → raw ≈ 0.01, priority 1.
+    raw_urgency     = profile.perishability * (1.0 - remaining_fraction)
+    urgency_priority = min(10, max(1, round(raw_urgency + 1)))  # clamp to 1–10
+
+    return remaining_fraction, urgency_priority, warnings
+
+
+def _score_regional(
+    profile: FoodProfile,
+    region: Region,
+) -> tuple[float, list[str]]:
+    """
+    Look up how well this food type survives in the current region.
+
+    Returns
+    -------
+    score    : 0.0 (very poorly suited) → 1.0 (ideal region)
+    warnings : advisory warning if score is below 0.4
+    """
+    warnings: list[str] = []
+
+    # .get() with default 0.5 handles any region not listed in the profile
+    # (neutral assumption rather than failing or penalising heavily).
+    score = profile.regional_scores.get(region, 0.5)
+
+    if score < 0.4:
+        # Below 0.4 the item is likely to degrade faster here than expected.
+        # This is advisory — it does NOT alone cause rejection or quarantine,
+        # but it does reduce confidence and may be surfaced to an operator
+        # for redistribution decisions.
+        warnings.append(
+            f"Low regional suitability ({score:.2f}) for region '{region.value}' — "
+            f"consider redistributing to a better-suited facility"
+        )
+
+    return score, warnings
+
+
+def _select_bin(
+    profile:       FoodProfile,
+    temp_score:    float,
+    regional_score: float,
+) -> tuple[Optional[Bin], float]:
+    """
+    Choose the most appropriate bin from the food's ordered allowed_bins list.
+
+    Logic
+    -----
+    - Start with the most-preferred bin (index 0).
+    - If temperature is borderline (score 0.5) AND a fallback exists, step
+      to the second-choice bin — it is safer to use a more conservative
+      destination when the reading is ambiguous.
+    - Reduce confidence further if regional suitability is poor, because
+      the item may not last as long as expected even in the chosen bin.
+
+    Returns
+    -------
+    bin        : chosen Bin enum value (or None if allowed_bins is empty)
+    confidence : 1.0 = first-choice bin, 0.6 = fallback bin;
+                 further reduced if regional score < 0.4
+    """
+    if not profile.allowed_bins:
+        # Catalog data error — no valid bin defined for this food type.
+        return None, 0.0
+
+    chosen_bin  = profile.allowed_bins[0]   # start with most-preferred choice
+    confidence  = 1.0                       # full confidence for first-choice bin
+
+    if temp_score == 0.5 and len(profile.allowed_bins) > 1:
+        # Borderline temperature — step down to the secondary bin.
+        # Example: strawberry at 3.8 °C (borderline near max 4.0 °C) goes
+        # to freezer instead of refrigeration to be safe.
+        chosen_bin  = profile.allowed_bins[1]
+        confidence  = 0.6   # reduced because we used a non-preferred destination
+
+    if regional_score < 0.4:
+        # Poor regional fit — reduce confidence further, but don't change the
+        # bin (the regional issue is about longevity, not immediate safety).
+        confidence = max(0.3, confidence - 0.2)
+
+    return chosen_bin, confidence
+
+
+def _select_action(
+    profile:     FoodProfile,
+    destination: Bin,
+    temp_score:  float,
+    urgency:     int,
+) -> Action:
+    """
+    Translate scores and flags into a single physical hardware command.
+
+    Rules are evaluated in strict priority order:
+      1. Unsafe temperature (score 0.0) → always open the reject chute.
+      2. Fragile item OR quarantine destination → robotic arm for precision.
+      3. Very high urgency (≥ 9) → stop belt for careful hand-off.
+      4. Everything else → passive lane divert (fastest, default path).
+    """
+    if temp_score == 0.0:
+        # Temperature check already failed — this item is being rejected.
+        # Open the reject trapdoor directly; no other action is appropriate.
+        return Action.REJECT_CHUTE
+
+    if profile.requires_robotic_arm or destination == Bin.QUARANTINE:
+        # Fragile items: divert gate impact would cause physical damage.
+        # Quarantine: operator needs to inspect the item in place — robotic
+        # arm places it carefully into the quarantine bin without dropping.
+        return Action.ROBOTIC_ARM
+
+    if urgency >= 9:
+        # Near-expiry, high-perishability item — halt the belt so the item
+        # doesn't get lost in the queue. The arm or operator picks immediately.
+        return Action.CONVEYOR_STOP
+
+    # Default: passive gate divert. Fastest path, no motor wear, no arm cycle.
+    return Action.DIVERT_LANE
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 8 — EDGE-CASE HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+# These four functions handle specific failure modes that would break the
+# main decision pipeline if handled inline. Isolating them keeps sort_item()
+# readable and makes the failure modes independently testable.
+
+def _handle_unknown_food(sample: FoodSample) -> SortDecision:
+    """
+    Called when food_type is not found in FOOD_CATALOG.
+    No safe temperature range exists → quarantine for human inspection.
+    Confidence is explicitly 0.0 — the machine has no information to reason with.
+    """
+    logger.warning(
+        "Unknown food type '%s' (item %s) — routing to quarantine",
+        sample.food_type, sample.item_id
+    )
+    return SortDecision(
+        item_id=sample.item_id,
+        destination=Bin.QUARANTINE,
+        action=Action.ROBOTIC_ARM,          # careful placement for unknown item
+        priority=5,                         # mid-priority — inspect soon but not emergency
+        confidence=0.0,                     # zero confidence: engine has no basis for a decision
+        reason=(
+            f"Food type '{sample.food_type}' not found in catalog. "
+            f"Quarantined for human inspection and catalog update."
+        ),
+        condition=FoodCondition.BAD,        # unknown item cannot be confirmed safe
+        warnings=[f"Unrecognised food type: '{sample.food_type}'"],
+    )
+
+
+def _handle_expired_item(sample: FoodSample, profile: FoodProfile) -> SortDecision:
+    """
+    Called when the item has exceeded its shelf life.
+    Shelf-life expiry is always a hard reject — no other criteria matter.
+    Confidence 1.0 because this is a deterministic rule, not a probabilistic score.
+    """
+    logger.warning(
+        "EXPIRED: %s (item %s) — %.1f h elapsed vs %.1f h max",
+        profile.name, sample.item_id,
+        sample.hours_since_harvest, profile.shelf_life_hours
+    )
+    return SortDecision(
+        item_id=sample.item_id,
+        destination=Bin.REJECT,
+        action=Action.REJECT_CHUTE,
+        priority=10,                        # process immediately — expired item on belt is a liability
+        confidence=1.0,                     # certain: rule-based, not probabilistic
+        reason=(
+            f"{profile.name} is expired: {sample.hours_since_harvest:.1f} h elapsed "
+            f"vs {profile.shelf_life_hours:.1f} h maximum shelf life."
+        ),
+        condition=FoodCondition.BAD,        # expired = definitively bad
+        warnings=["Item past shelf life — REJECTED"],
+    )
+
+
+def _handle_unsafe_temperature(sample: FoodSample, profile: FoodProfile) -> SortDecision:
+    """
+    Called when the measured temperature is outside the safe range (not borderline).
+    Temperature failure is always a hard reject — food may already be spoiling or frozen.
+    """
+    logger.warning(
+        "UNSAFE TEMP: %s at %.1f °C (safe: %.1f–%.1f °C) (item %s)",
+        profile.name, sample.measured_temp_c,
+        profile.safe_temp_range.min_c, profile.safe_temp_range.max_c,
+        sample.item_id
+    )
+    return SortDecision(
+        item_id=sample.item_id,
+        destination=Bin.REJECT,
+        action=Action.REJECT_CHUTE,
+        priority=10,
+        confidence=1.0,
+        reason=(
+            f"{profile.name} measured at {sample.measured_temp_c:.1f} °C, "
+            f"outside safe range [{profile.safe_temp_range.min_c}, "
+            f"{profile.safe_temp_range.max_c}] °C. Rejected for food safety."
+        ),
+        condition=FoodCondition.BAD,        # unsafe temperature = bad regardless of age
+        warnings=["Temperature outside safe range — REJECTED"],
+    )
+
+
+def _handle_conflicting_criteria(
+    sample:      FoodSample,
+    profile:     FoodProfile,
+    temp_score:  float,
+    reg_score:   float,
+    urgency:     int,
+    warnings:    list[str],
+) -> SortDecision:
+    """
+    Called when all individual criteria pass but the composite confidence
+    falls below CONFIDENCE_THRESHOLD (0.40).
+    This is the safety net for subtle combinations — e.g., borderline
+    temperature + poor regional fit + high perishability together produce
+    a confidence too low to trust an automatic placement.
+    Routes to QUARANTINE so a human can make the final call.
+    """
+    logger.warning(
+        "LOW CONFIDENCE: %s (item %s) temp=%.2f regional=%.2f urgency=%d — quarantined",
+        profile.name, sample.item_id, temp_score, reg_score, urgency
+    )
+    return SortDecision(
+        item_id=sample.item_id,
+        destination=Bin.QUARANTINE,
+        action=Action.ROBOTIC_ARM,
+        priority=urgency,
+        confidence=0.35,    # fixed low value — signals ambiguity to monitoring systems
+        reason=(
+            f"{profile.name} has conflicting sort signals: "
+            f"temp_score={temp_score:.2f}, regional={reg_score:.2f}, urgency={urgency}. "
+            f"Confidence too low for automatic placement — quarantined for human review."
+        ),
+        condition=FoodCondition.CRITICAL,   # conflicting signals → treat as critical until inspected
+        warnings=warnings,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9 — CORE SORT FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+
+CONFIDENCE_THRESHOLD = 0.40     # below this → quarantine, never auto-place
+
+
+def sort_item(sample: FoodSample) -> SortDecision:
+    """
+    Primary entry point for the sorting engine.
+
+    Takes one FoodSample (from the sensor/vision layer) and evaluates all
+    four criteria to produce a SortDecision ready for hardware execution.
+
+    The pipeline runs in strict priority order so that hard safety failures
+    (expiry, unsafe temperature) are caught before the more nuanced scoring.
+
+    Parameters
+    ----------
+    sample : FoodSample   — the incoming item with all sensor readings
+
+    Returns
+    -------
+    SortDecision          — destination + action + full scoring metadata
+    """
+
+    # ── Step 0: Catalog lookup ────────────────────────────────────────────
+    # Normalise the food type string (lowercase + strip whitespace) so minor
+    # formatting differences in the upstream barcode/vision output don't
+    # cause false "unknown" results.
+    profile = FOOD_CATALOG.get(sample.food_type.lower().strip())
+
+    if profile is None:
+        # No profile means we have no safe temperature range, no bin list —
+        # nothing to reason with. Quarantine immediately rather than guess.
+        return _handle_unknown_food(sample)
+
+    all_warnings: list[str] = []   # accumulate warnings across all steps
+
+    # ── Step 1: Perishability / shelf-life check ──────────────────────────
+    # Checked BEFORE temperature because an expired item is rejected
+    # regardless of its temperature — checking temperature first would waste
+    # a potential hard reject on a sensor reading that doesn't matter.
+    freshness_score, urgency, peri_warnings = _score_perishability(
+        profile, sample.hours_since_harvest
+    )
+    all_warnings.extend(peri_warnings)
+
+    if freshness_score <= 0.0:
+        # remaining_fraction = 0 means item is at or past its shelf life.
+        return _handle_expired_item(sample, profile)
+
+    # ── Step 2: Temperature check ─────────────────────────────────────────
+    # A score of 0.0 is an immediate hard reject.
+    # A score of 0.5 (borderline) continues to step 3 but will de-prefer
+    # the primary bin in step 4 and reduce composite confidence.
+    temp_score, temp_warnings = _score_temperature(profile, sample.measured_temp_c)
+    all_warnings.extend(temp_warnings)
+
+    if temp_score == 0.0:
+        return _handle_unsafe_temperature(sample, profile)
+
+    # ── Step 3: Regional suitability ──────────────────────────────────────
+    # Advisory only — a low regional score generates a warning and reduces
+    # confidence but never alone causes rejection. A facility might store a
+    # food in a suboptimal region if it's the only option; the engine flags
+    # it for the operator but still routes the item.
+    reg_score, reg_warnings = _score_regional(profile, sample.current_region)
+    all_warnings.extend(reg_warnings)
+
+    # ── Step 4: Bin selection (destination compatibility) ─────────────────
+    # Walks the food's ordered allowed_bins list. Borderline temperature
+    # and low regional score both feed into this decision.
+    destination, bin_confidence = _select_bin(profile, temp_score, reg_score)
+
+    if destination is None:
+        # Catalog data error — allowed_bins is empty for this food type.
+        all_warnings.append("No allowed bins defined in food profile — catalog data error.")
+        return _handle_conflicting_criteria(
+            sample, profile, temp_score, reg_score, urgency, all_warnings
+        )
+
+    # ── Step 5: Physical action ───────────────────────────────────────────
+    # Converts all collected information into a single hardware command.
+    action = _select_action(profile, destination, temp_score, urgency)
+
+    # ── Step 6: Composite confidence score ────────────────────────────────
+    # Weighted sum across all four criterion scores.
+    # destination_score: 1.0 if we got the first-choice bin, 0.7 if fallback.
+    # freshness_score is already 0–1 from _score_perishability.
+    destination_score    = 1.0 if destination == profile.allowed_bins[0] else 0.7
+    freshness_normalised = min(1.0, freshness_score)    # safety clamp, should already be 0–1
+
+    composite = (
+        CRITERION_WEIGHTS["temperature"]   * temp_score           +
+        CRITERION_WEIGHTS["destination"]   * destination_score     +
+        CRITERION_WEIGHTS["perishability"] * freshness_normalised  +
+        CRITERION_WEIGHTS["regional"]      * reg_score
+    )
+    # Blend composite with bin_confidence (already reflects temperature and
+    # regional penalties from _select_bin). Average of the two gives a score
+    # that combines all four criteria with the bin-selection logic.
+    final_confidence = round((composite + bin_confidence) / 2.0, 3)
+
+    # ── Step 7: Low-confidence guard ──────────────────────────────────────
+    # If no single criterion failed hard but the combination produces a
+    # confidence below the threshold, override to quarantine.
+    # This is the catch-all for subtle combinations the hard-stop checks
+    # in steps 1–2 didn't catch.
+    if final_confidence < CONFIDENCE_THRESHOLD:
+        return _handle_conflicting_criteria(
+            sample, profile, temp_score, reg_score, urgency, all_warnings
+        )
+
+    # ── Step 8: Assemble and return the decision ──────────────────────────
+    reason = (
+        f"{profile.name} → {destination.value} via {action.value} | "
+        f"temp={temp_score:.2f}  freshness={freshness_score:.2f}  "
+        f"regional={reg_score:.2f}  urgency={urgency}/10  "
+        f"confidence={final_confidence:.3f}"
+    )
+    logger.info("SORT | item=%-10s | %s", sample.item_id, reason)
+
+    # Assess human-readable food condition using the scores already computed.
+    # This does not change the routing decision — it attaches a display label.
+    condition, _cond_desc = assess_food_condition(
+        sample, freshness_score, temp_score, destination
+    )
+
+    return SortDecision(
+        item_id=sample.item_id,
+        destination=destination,
+        action=action,
+        priority=urgency,
+        confidence=final_confidence,
+        reason=reason,
+        condition=condition,
+        warnings=all_warnings,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 10 — BATCH SORT UTILITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sort_batch(samples: list[FoodSample]) -> list[SortDecision]:
+    """
+    Sort a list of FoodSamples and return decisions ordered by descending
+    priority (most urgent first).
+
+    Use this when multiple items have accumulated in the intake buffer —
+    for example after a conveyor jam clears or during a pallet scan.
+    The belt controller should execute decisions in the order returned:
+    highest priority (most perishable / most urgent) gets routed first.
+
+    For single-item real-time throughput, call sort_item() directly.
+    """
+    # Process every sample through the full decision engine
+    decisions = [sort_item(s) for s in samples]
+
+    # Sort by priority descending so the most urgent items are at index 0.
+    # Python's sort is stable — equal-priority items keep their intake order,
+    # which is correct (FIFO within the same urgency tier).
+    return sorted(decisions, key=lambda d: d.priority, reverse=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 11 — SIMULATED HARDWARE DRIVER LAYER
+# ─────────────────────────────────────────────────────────────────────────────
+# In a production system these functions would send serial/CAN bus/PLC
+# commands to the actual hardware. Here they print what they would do,
+# simulating the timing and confirmation messages a real driver returns.
+
+def driver_divert_lane(decision: SortDecision) -> None:
+    """
+    Simulates flipping a pneumatic gate to divert the item to its bin lane.
+    Real implementation: send a 24 V pulse to the gate solenoid for 150 ms,
+    then read back the gate-closed limit switch to confirm.
+    """
+    print(
+        f"  [DRIVER] DIVERT LANE → {decision.destination.value} "
+        f"(item {decision.item_id})"
+    )
+    time.sleep(0.05)    # simulate 50 ms gate actuation latency
+    print(f"  [DRIVER] Gate confirmed closed — item cleared to lane.")
+
+
+def driver_conveyor_stop(decision: SortDecision) -> None:
+    """
+    Simulates halting the conveyor belt at the sort station.
+    Real implementation: ramp the belt motor down to 0 RPM over 200 ms,
+    wait for the encoder to confirm stopped, then signal the pick station.
+    """
+    print(
+        f"  [DRIVER] CONVEYOR STOP — holding belt for item {decision.item_id} "
+        f"(priority {decision.priority}/10)"
+    )
+    time.sleep(0.08)    # simulate ramp-down latency
+    print(f"  [DRIVER] Belt at 0 RPM. Pick station armed.")
+    # In real code: after pick confirmation, call driver_belt_resume()
+
+
+def driver_robotic_arm(decision: SortDecision) -> None:
+    """
+    Simulates triggering a full robotic pick-and-place cycle.
+    Real implementation: send a PICK command with bin ID and item coordinates
+    to the arm controller over TCP, await ACK, then await PLACED confirmation.
+    """
+    print(
+        f"  [DRIVER] ROBOTIC ARM → pick item {decision.item_id} "
+        f"→ place in {decision.destination.value}"
+    )
+    time.sleep(0.12)    # simulate arm travel + place cycle time
+    print(f"  [DRIVER] Arm cycle complete. Item placed. Arm returning to home.")
+
+
+def driver_reject_chute(decision: SortDecision) -> None:
+    """
+    Simulates opening the reject trapdoor under the belt.
+    Real implementation: energise the chute solenoid, wait 300 ms,
+    de-energise (spring returns chute to closed), log item serial as REJECTED.
+    """
+    print(
+        f"  [DRIVER] REJECT CHUTE OPEN — dropping item {decision.item_id} "
+        f"({'EXPIRED' if 'shelf life' in decision.reason else 'UNSAFE TEMP'})"
+    )
+    time.sleep(0.06)
+    print(f"  [DRIVER] Chute closed. Item logged as rejected.")
+
+
+# Dispatch table: maps Action enum → driver function.
+# Using a dict instead of if/elif means adding a new Action only requires
+# adding an entry here and writing the driver function — sort_item() doesn't
+# need to change.
+ACTION_DRIVERS: dict[Action, callable] = {
+    Action.DIVERT_LANE:  driver_divert_lane,
+    Action.CONVEYOR_STOP: driver_conveyor_stop,
+    Action.ROBOTIC_ARM:  driver_robotic_arm,
+    Action.REJECT_CHUTE: driver_reject_chute,
+}
+
+
+def execute_decision(decision: SortDecision) -> None:
+    """
+    Dispatch a SortDecision to the correct hardware driver.
+    This is what the main control loop calls after sort_item() returns.
+    """
+    driver_fn = ACTION_DRIVERS.get(decision.action)
+    if driver_fn is None:
+        # Unknown action — should never happen if Enums are used correctly,
+        # but guard against it anyway to avoid a silent no-op.
+        logger.error("No driver found for action '%s' (item %s)", decision.action, decision.item_id)
+        return
+    driver_fn(decision)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12 — SIMULATED SENSOR / CONVEYOR FEED
+# ─────────────────────────────────────────────────────────────────────────────
+# In production these functions would be replaced by real sensor drivers.
+# Here they generate realistic synthetic readings to exercise every code path.
+
+def simulate_ir_sensor(profile: FoodProfile, scenario: str = "normal") -> float:
+    """
+    Simulate an IR temperature sensor reading for a food item.
+
+    Scenarios
+    ---------
+    "normal"     — temperature near the midpoint of the safe range ± small noise
+    "borderline" — temperature within 1.5 °C of the upper boundary
+    "unsafe"     — temperature above the upper boundary by 8–15 °C
+    "frozen"     — temperature below the lower boundary (useful for fresh items)
+
+    In real hardware: read a 10-bit ADC value from the MLX90614 IR sensor,
+    apply the calibration polynomial, compensate for ambient temperature drift.
+    """
+    mid = (profile.safe_temp_range.min_c + profile.safe_temp_range.max_c) / 2.0
+    noise = random.uniform(-0.5, 0.5)   # ±0.5 °C simulates sensor measurement noise
+
+    if scenario == "borderline":
+        # Within 1.5 °C of the upper limit — triggers borderline path
+        return round(profile.safe_temp_range.max_c - 1.5 + noise, 1)
+    elif scenario == "unsafe":
+        # 8–15 °C above the upper limit — triggers reject path
+        return round(profile.safe_temp_range.max_c + random.uniform(8, 15) + noise, 1)
+    elif scenario == "frozen":
+        # 5–10 °C below lower limit — triggers reject path for non-frozen foods
+        return round(profile.safe_temp_range.min_c - random.uniform(5, 10) + noise, 1)
+    else:
+        # Normal: midpoint with noise — should produce a clean sort
+        return round(mid + noise, 1)
+
+
+def simulate_harvest_hours(profile: FoodProfile, freshness: str = "fresh") -> float:
+    """
+    Simulate how many hours have elapsed since this item was harvested/produced.
+
+    freshness options
+    -----------------
+    "fresh"    — 10–25 % of shelf life elapsed (newly arrived stock)
+    "aging"    — 50–70 % of shelf life elapsed (mid-cycle stock)
+    "expiring" — 85–95 % of shelf life elapsed (near end of life)
+    "expired"  — 110–130 % of shelf life elapsed (past the limit)
+
+    In real hardware: read the harvest timestamp from the RFID tag or
+    QR/barcode label, subtract from the current UTC clock.
+    """
+    if freshness == "fresh":
+        fraction = random.uniform(0.10, 0.25)
+    elif freshness == "aging":
+        fraction = random.uniform(0.50, 0.70)
+    elif freshness == "expiring":
+        fraction = random.uniform(0.85, 0.95)
+    else:  # expired
+        fraction = random.uniform(1.10, 1.30)
+
+    # Return hours, rounded to one decimal place
+    return round(profile.shelf_life_hours * fraction, 1)
+
+
+def generate_sample_batch(region: Region = Region.TEMPERATE) -> list[FoodSample]:
+    """
+    Generate a representative batch of 12 synthetic food samples covering
+    all major code paths in the sort engine.
+
+    In production this function would not exist — FoodSamples would come
+    directly from the vision system and sensor array for each real item.
+    """
+    food_types  = list(FOOD_CATALOG.keys())
+    item_count  = 0
+
+    samples: list[FoodSample] = []
+
+    def make(food_type: str, temp_scenario: str, freshness: str, note: str) -> FoodSample:
+        nonlocal item_count
+        item_count += 1
+        profile = FOOD_CATALOG[food_type]
+        temp    = simulate_ir_sensor(profile, temp_scenario)
+        hours   = simulate_harvest_hours(profile, freshness)
+        item_id = f"ITM-{item_count:04d}"
+        logger.debug("Generated sample: %s %s temp=%.1f h=%.1f [%s]",
+                     item_id, food_type, temp, hours, note)
+        return FoodSample(food_type, temp, region, hours, item_id)
+
+    # One sample per food type with varied conditions
+    samples.append(make("strawberry",     "normal",     "fresh",    "nominal fresh strawberry"))
+    samples.append(make("banana",         "normal",     "aging",    "mid-cycle banana"))
+    samples.append(make("chicken_breast", "borderline", "fresh",    "borderline temp chicken"))
+    samples.append(make("canned_beans",   "normal",     "fresh",    "nominal canned beans"))
+    samples.append(make("ice_cream",      "unsafe",     "aging",    "unsafe temp ice cream"))
+    samples.append(make("mango",          "normal",     "expiring", "near-expiry mango"))
+    samples.append(make("whole_milk",     "normal",     "aging",    "aging whole milk"))
+    samples.append(make("flour",          "normal",     "fresh",    "nominal flour"))
+    samples.append(make("salmon_fillet",  "borderline", "expiring", "borderline + near-expiry salmon"))
+    samples.append(make("chicken_breast", "normal",     "expired",  "expired chicken — should reject"))
+    samples.append(make("strawberry",     "unsafe",     "fresh",    "unsafe temp strawberry — reject"))
+
+    # One unknown food type to exercise the quarantine path
+    item_count += 1
+    samples.append(FoodSample("dragon_fruit", 18.0, region, 10.0, f"ITM-{item_count:04d}"))
+
+    return samples
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 13 — DASHBOARD / SUMMARY PRINTER
+# ─────────────────────────────────────────────────────────────────────────────
+# Prints a formatted terminal dashboard after processing a batch.
+# In production this output would go to a SCADA screen or be serialised
+# to JSON and sent to the monitoring service.
+
+def print_dashboard(decisions: list[SortDecision]) -> None:
+    """Print a formatted summary of a batch of sort decisions."""
+
+    LINE = "═" * 78
+
+    # ── Per-item detail ───────────────────────────────────────────────────
+    print(f"\n{LINE}")
+    print("  FOOD SORTER PROTOTYPE  —  SORT RESULTS")
+    print(LINE)
+
+    for d in decisions:
+        # Confidence bar — visual indicator scaled to 20 characters
+        bar_len  = round(d.confidence * 20)
+        bar      = "█" * bar_len + "░" * (20 - bar_len)
+        conf_pct = round(d.confidence * 100)
+
+        # Condition symbol — one-character visual status indicator
+        cond     = d.condition or FoodCondition.BAD
+        symbol   = CONDITION_SYMBOLS.get(cond, "?")
+
+        print(f"\n  [{d.item_id}]")
+        print(f"    Condition    : {symbol}  {cond.value}")
+        print(f"    Destination  : {d.destination.value}")
+        print(f"    Action       : {d.action.value}")
+        print(f"    Priority     : {d.priority}/10")
+        print(f"    Confidence   : [{bar}] {conf_pct:3d}%")
+        print(f"    Reason       : {d.reason}")
+        if d.warnings:
+            for w in d.warnings:
+                print(f"    ⚠ Warning    : {w}")
+
+    # ── Aggregate statistics ──────────────────────────────────────────────
+    total      = len(decisions)
+    rejected   = sum(1 for d in decisions if d.destination == Bin.REJECT)
+    quarantined = sum(1 for d in decisions if d.destination == Bin.QUARANTINE)
+    sorted_ok  = total - rejected - quarantined
+    avg_conf   = sum(d.confidence for d in decisions) / total if total else 0
+
+    print(f"\n{LINE}")
+    print("  BATCH SUMMARY")
+    print(f"  {'Total items processed':<30} {total}")
+    print(f"  {'Successfully sorted':<30} {sorted_ok}  "
+          f"({round(sorted_ok / total * 100) if total else 0} %)")
+    print(f"  {'Rejected (food safety)':<30} {rejected}  "
+          f"({round(rejected / total * 100) if total else 0} %)")
+    print(f"  {'Quarantined (low confidence)':<30} {quarantined}  "
+          f"({round(quarantined / total * 100) if total else 0} %)")
+    print(f"  {'Average confidence':<30} {avg_conf:.3f}")
+
+    # Bin fill report
+    bin_counts: dict[Bin, int] = {b: 0 for b in Bin}
+    for d in decisions:
+        bin_counts[d.destination] += 1
+
+    print(f"\n  BIN FILL REPORT")
+    for bin_val, count in bin_counts.items():
+        if count > 0:
+            bar = "█" * count + "░" * (total - count)
+            print(f"  {bin_val.value:<25} [{bar}] {count}")
+
+    # ── Food Condition Report ─────────────────────────────────────────────
+    # Groups every item by its FoodCondition level and prints a summary table.
+    # This is the section an operator or food safety auditor reads to quickly
+    # understand the health of the current batch without looking at raw scores.
+    #
+    # For each condition level we print:
+    #   • The symbol and level name
+    #   • How many items are at that level and what percentage of the batch
+    #   • Which specific items (by ID and food type) are at that level
+    #   • The recommended handling action for that level
+
+    print(f"\n{LINE}")
+    print("  FOOD CONDITION REPORT")
+    print(LINE)
+
+    # Build a mapping of FoodCondition → list of decisions at that level.
+    # We iterate through FoodCondition in severity order (best → worst) so the
+    # report reads top-to-bottom from good news to bad news.
+    condition_order = [
+        FoodCondition.GOOD,
+        FoodCondition.USE_SOON,
+        FoodCondition.EXPIRING_SOON,
+        FoodCondition.CRITICAL,
+        FoodCondition.BAD,
+    ]
+
+    # Group decisions by condition level.
+    # dict comprehension builds an empty list for every level upfront so levels
+    # with zero items still appear in the report (makes it easier to confirm
+    # nothing was missed).
+    condition_groups: dict[FoodCondition, list[SortDecision]] = {
+        level: [] for level in condition_order
+    }
+    for d in decisions:
+        level = d.condition or FoodCondition.BAD   # treat None as BAD (safety default)
+        condition_groups[level].append(d)
+
+    for level in condition_order:
+        group   = condition_groups[level]
+        count   = len(group)
+        pct     = round(count / total * 100) if total else 0
+        symbol  = CONDITION_SYMBOLS[level]
+        action  = CONDITION_ACTIONS[level]
+
+        # Build a compact list of "ITM-NNNN (food_type)" strings for this level.
+        # If there are no items at this level, print a dash so the row still
+        # appears and the operator knows it was checked.
+
+        def _food_name(d: SortDecision) -> str:
+            # Normal sort reasons: "food_name → bin_name via action | ..."
+            # Edge-case reasons (expired, unsafe): "food_name is expired..." or
+            #   "food_name measured at..." — first word is always the food name.
+            # Unknown-type reason: "Food type 'dragon_fruit' not found..."
+            #   — word[0] is "Food", so extract the quoted name instead.
+            first = d.reason.split()[0]
+            if first == "Food":
+                try:
+                    return d.reason.split("'")[1]   # grabs text between first pair of quotes
+                except IndexError:
+                    return "unknown"
+            return first
+
+        if group:
+            pass    # items printed in the loop below
+        else:
+            print(f"\n  {symbol}  {level.value:<15}  {count:2d} items  ({pct:3d} %)")
+            print(f"     Action : {action}")
+            print(f"     Items  : —")
+            continue     # skip to next level — nothing to print
+
+        print(f"\n  {symbol}  {level.value:<15}  {count:2d} items  ({pct:3d} %)")
+        print(f"     Action : {action}")
+        if group:
+            # Wrap the items list at 72 characters for readability
+            line_buf = "     Items  : "
+            for i, d in enumerate(group):
+                food_name = _food_name(d)
+                entry     = f"{d.item_id} ({food_name})"
+                if i < len(group) - 1:
+                    entry += ",  "
+                # Start a new indented line when the current line would overflow
+                if len(line_buf) + len(entry) > 72:
+                    print(line_buf.rstrip(", "))
+                    line_buf = "             " + entry  # continuation indent
+                else:
+                    line_buf += entry
+            print(line_buf)
+
+    print(f"\n{LINE}\n")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 14 — MAIN ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+
+    print("\n" + "═" * 78)
+    print("  FOOD SORTING MACHINE — PROTOTYPE STARTUP")
+    print("═" * 78)
+    print("  Simulating conveyor belt feed in TEMPERATE region facility.\n")
+
+    # ── Generate a synthetic batch of items ───────────────────────────────
+    # In production: items arrive from the vision/sensor pipeline one at a time.
+    # Here: generate_sample_batch() builds a representative set all at once.
+    random.seed(42)     # fix the seed so results are reproducible for demo purposes
+    batch = generate_sample_batch(region=Region.TEMPERATE)
+
+    print(f"  {len(batch)} items detected on intake belt. Running sort engine...\n")
+
+    # ── Run the batch sort engine ─────────────────────────────────────────
+    # sort_batch() calls sort_item() on each sample, then orders results by
+    # priority descending — most urgent items are executed first.
+    decisions = sort_batch(batch)
+
+    # ── Execute each decision through the simulated hardware drivers ──────
+    # In production: this loop would run in the main control thread,
+    # calling real driver functions that communicate with PLC/robot controllers.
+    print("  Executing hardware actions (priority order):")
+    print("  " + "─" * 60)
+
+    for decision in decisions:
+        print(
+            f"\n  Routing [{decision.item_id}] — "
+            f"priority {decision.priority}/10 — "
+            f"confidence {decision.confidence:.2f}"
+        )
+        execute_decision(decision)  # calls the appropriate driver function
+
+    # ── Print the terminal dashboard ──────────────────────────────────────
+    print_dashboard(decisions)
