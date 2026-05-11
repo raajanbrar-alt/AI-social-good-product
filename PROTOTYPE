@@ -34,6 +34,13 @@ Sections in this file:
   14. Main entry point
 """
 
+# COMMENT-Section 1 - Importing and Logging Config
+# Importing everything the script requires from the standard library - no external packages needed. logging initializes a console logger such that each sort decision and warning message is output with a level (INFO, WARNING). 
+# random is used by the simulated sensor to provide some noise in the measurements. 
+# time is used by the hardware simulations to generate artificial delays as if there was hardware actually doing the work. 
+# dataclass and field make structured container classes in Sections 5 & 6. 
+# Enum provides type safety on constants in Section 2. Optional allows a field in a data class to be a value or null.
+# Used by: Everything - All other sections use imports and config initialized in this section.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 1 — IMPORTS & LOGGING SETUP
@@ -54,6 +61,14 @@ logging.basicConfig(
     format="%(levelname)-8s | %(message)s"  # left-aligned 8-char level name, then message
 )
 logger = logging.getLogger(__name__)        # module-level logger; name = "food_sorter_prototype"
+
+
+# COMMENT-Section 2 - Enumerations (Bin, Action, Region)
+# Defines the machine's language using three Enum classes in order to prevent any errors caused by typos.
+# Bin - The seven physical destination locations of refrigeration, freezer, dry storage, ambient bin, tropical bin, quarantine, and reject chute.
+# Action - Four types of hardware control signals: divert the lane gate, stop the conveyor belt, activate the robotic arm, or open the reject trapdoor.
+# Region - Five climate types of tropical, temperate, arid, arctic, and highland regions, used when determining how well the food type will preserve itself in the environment of its location.
+# Used by: FoodProfile (Section 3) uses Bin and Region. SortDecision (Section 6) uses Bin and Action. Each scoring function uses the enumerations as return values or for comparisons.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -90,6 +105,15 @@ class Region(str, Enum):
     ARID      = "arid"                      # low humidity (<30 %), variable temperature
     ARCTIC    = "arctic"                    # very low temperature, low humidity
     HIGHLAND  = "highland"                  # high altitude, low atmospheric pressure
+
+
+# COMMENT-Section 3 - Data Structures (TemperatureRange, FoodProfile)
+#Defines two immutable data structures that describe food items in detail.
+#TemperatureRange holds the minimum and maximum temperatures (min_c, max_c) in Celsius, and provides these functions:
+#contains(temp) - Returns "True" if temp is between min and max (inclusive).
+#is_borderline(temp, tolerance=2.0) - Returns "True" if temp is within 2 degrees of min/max. This tolerance is meant to represent real-world sensor noise and serves as the boundary point for the borderline scoring route.
+#FoodProfile contains all of the information about a food item, including: TemperatureRange, shelf_life (in hours), a number from 1-10 describing perishability, tuple of allowed bins (preferred first), dict of region to score pairs, and boolean flag if food item must be placed in a bin by robotic arm.
+#Used by: FOOD_CATALOG (Section 4) consists of multiple FoodProfiles. The scoring helpers in Section 7 read each field from FoodProfile.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -152,6 +176,14 @@ class FoodProfile:
     allowed_bins:         tuple[Bin, ...]       # non-empty, ordered
     regional_scores:      dict[Region, float]   # all five Region keys expected
     requires_robotic_arm: bool = False          # default False — most items can be diverted
+
+
+# COMMENTS-Section 4 — Food Catalog (FOOD_CATALOG)
+# Simple Python dict of food type strings (all lowercase) to FoodProfile objects. Nine food types are specified: strawberry, banana, chicken breast, canned beans, ice cream, mango, whole milk, flour, and salmon fillet. 
+# Each type was selected to exercise a distinct combination of destinations, perishability, and regional suitability profiles.
+# In production code the catalog would come from a database or YAML/JSON file — the FoodProfile object structure does not change.
+# Feeds into: sort_item() (Section 9) uses the food type of incoming samples to find the corresponding profile as the first step in its logic. 
+# assess_food_condition() (Section 6b) calls _get_shelf_hours() which accesses the catalog as well. generate_sample_batch() (Section 12) uses the catalog to pick real-life temperature and harvest hour values.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,6 +370,20 @@ FOOD_CATALOG: dict[str, FoodProfile] = {
 }
 
 
+# COMMENTS - Section 5 — Incoming Sample Dataclass (FoodSample)
+# The input data structure for communication between sensor/hardware layer and the sorting engine. 
+# Each food item arriving on the intake belt needs to be represented in terms of this class before sort_item() can take a look. Its five attributes correspond to the four criteria:
+
+# food_type → used for looking up the FoodProfile (criteria 1 & 2)
+# measured_temp_c → evaluated against the safe temperature range (criterion 2)
+# hours_since_harvest → used to calculate freshness against shelf life (criterion 3)
+# current_region → looked up in regional scores (criterion 4)
+# item_id → passed straight through into the SortDecision class (criteria 0 & N/A)
+
+# Feeds into: sort_item() accepts one FoodSample as an argument. Every edge-case handler needs it too so that they can copy item_id back into the SortDecision class for tracing purposes. 
+# assess_food_condition() takes it as well to pass item_id back into the decision.
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 5 — INCOMING SAMPLE DATACLASS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,6 +415,19 @@ class FoodSample:
     current_region:      Region
     hours_since_harvest: float
     item_id:             str = "UNKNOWN"    # default for unlabelled items
+
+
+# COMMENTS-Section 6 — Sort Decision Dataclass (SortDecision)
+#The output data structure of our sorting engine — sort_item()'s return value. Only destination and action fields are needed by the hardware drivers; the rest are meant for monitoring/logging purposes:
+
+# priority (1-10) defines sorting order; higher numbers mean earlier processing
+# confidence (0.0 - 1.0) is the overall quality rating across all criteria; all <0.40 sorts go into quarantine automatically
+# reason is a human-readable rationale for the decision; serves logging and user terminals
+# condition is the FoodCondition set by the food assessment module (Section 6b)
+# warnings list non-critical conditions that decreased confidence (may be empty for good sorts)
+
+#Feeds into: execute_decision() (Section 11) uses both destination and action fields. print_dashboard() (Section 13) reads all fields for display purpose. sort_batch() (Section 10) sorts SortDecisions by priority.
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -405,6 +464,27 @@ class SortDecision:
     reason:      str
     condition:   "FoodCondition" = None   # set by assess_food_condition() after sort_item()
     warnings:    list[str] = field(default_factory=list)    # mutable default needs field()
+
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMENTS-Section 6b — Food Condition Assessment (FoodCondition, assess_food_condition)
+
+# This section was added in this update to resolve the basic question "What condition is this item in?".
+# FoodCondition is an enumerated type with five possible states — GOOD, USE SOON, EXPIRING SOON, CRITICAL, and BAD — each having an associated operator command in the CONDITION_ACTIONS and terminal symbol in CONDITION_SYMBOLS dicts.
+# assess_food_condition() requires three pre-computed parameters passed from sort_item() — remaining fraction of shelf life (0–1.0), temperature safety rating (same scale), and destination bin — then evaluates nine rules with strict ordering:
+# Routed into the REJECT bin already → always BAD (exhaustively checked for separate messages in each case)
+# Temp safety < 0.0 → BAD
+# Remaining fraction < 0.0 → BAD
+# Temp safety = 0.0 and fraction < 0.2 → CRITICAL (both signals red)
+# Fraction < 0.1 → CRITICAL
+# Fraction < 0.3 → EXPIRING SOON
+# Temp safety = 0.0 and fraction > 0.1 → EXPIRING SOON (temp stress decreases effective life)
+# Fraction > 0.3 and temp safety > 0.0 → USE SOON
+# Fraction > 0.6 and temp safety > 0.0 → GOOD
+# Helper method _get_shelf_hours() is a small look-up function for retrieving the number of hours from the shelf life in FOOD_CATALOG for the "days to expiry" field in the message string.
+# Feeds into: sort_item() invokes the method at Step 8 for any item sorted normally. 
+# Four edge-case handlers set condition explicitly in their returned SortDecisions (no matter how; they always know which it should be — BAD or CRITICAL). 
+# print_dashboard() accesses d.condition for displaying the symbol in each line.
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -613,6 +693,22 @@ def _get_shelf_hours(sample: FoodSample) -> float:
     """
     profile = FOOD_CATALOG.get(sample.food_type.lower().strip())
     return profile.shelf_life_hours if profile else 0.0
+
+
+# COMMENTS-Section 7 — Criterion Scoring Helpers
+#Five scoring helper functions, each implementing the logic for exactly one criterion dimension and returning both a score (float between 0.0 and 1.0 inclusive) and a set of optional advisory warning messages.
+
+#_score_temperature(profile, temp) — compares measured surface temperature against a food-specific safe range. Returns 1.0 if within safe temperature range, 0.5 if in "borderline" (±2 °C of border), and 0.0 otherwise (TemperatureRange.is_borderline()). 
+#The latter case is the only hard safety trigger that guarantees automatic reject regardless of other scores.
+#_score_perishability(profile, hours_since_harvest) — calculates remaining_percentage (a float between 0.0 and 1.0) using elapsed_time/shelf_life, then clamps it to 1.0. Calculates urgency (1...10) by multiplying perishability rating with remaining_percentage. 
+#A 90% elapsed salmon fillet will have urgency=10, while canned beans at 1% will have urgency=1.
+#_score_regional(profile, region) — simply queries the corresponding key in the food_profile['regional_scores'] dictionary, or returns 0.5 if the region is missing from it. Generates warning at scores below 0.4.
+#_select_bin(profile, temp_score, regional_score) — iterates over the food's allowed_bins in specified order. Chooses the most suitable destination, drops bin confidence by 0.2 if the regional suitability is bad, or by 0.4 if both temperature is borderline (0.5) and a second-best option is available.
+#_select_action(profile, destination, temp_score, urgency) — implements four prioritised rules to convert all information into a physical hardware command. 
+# In priority order: bad temperature → reject chute, fragile → robotic arm, urgency >= 9 → stop conveyor, otherwise → passive diversion to lane.
+
+#Feeds into: _select_action(), _score_temperature(), _score_perishability(), _score_regional(), _select_bin() — collectively used by sort_item() (Section 9) in Steps 1...5 of its pipeline. _score_perishability() additionally passes its remaining_fraction parameter directly into assess_food_condition() (Section 6b).
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -826,6 +922,21 @@ def _select_action(
     return Action.DIVERT_LANE
 
 
+# COMMENTS-Section 8 — Edge-Case Handlers
+# Four specialised functions for handling specific failure modes that would cause the pipeline to break if implemented inside. All return a ready-to-use SortDecision object and short-circuit the sort_item() function.
+
+#_handle_unknown_food(sample) — triggered whenever the food type string is not found in FOOD_CATALOG. Unable to do any reasonable action as it lacks profile information about the type and can't access temperature/bin data. 
+# Routes to quarantine, confidence 0.0, condition BAD.
+#_handle_expired_item(sample, profile) — triggered whenever the calculated remaining_fraction <= 0.0, which means the item is expired past its shelf life period. 
+# Routes to reject chute unconditionally (confidence 1.0, condition BAD) because expired items are always bad food.
+#_handle_unsafe_temperature(sample, profile) — triggered whenever temperature score is 0.0, indicating that the food is outside the safety range entirely. 
+# Again a direct hard rule: route to reject chute (confidence 1.0, condition BAD) because this is unsafe.
+#_handle_conflicting_criteria(sample, profile, ...) — triggered whenever all criteria individually pass the hard stops but combined composite confidence is still <0.4. 
+# Catch-all handler that deals with edge cases such as temperature borderline + bad regional suitability + high perishability. Routes to quarantine with confidence 0.35 (condition CRITICAL for human review).
+
+#Feeds into: each function in this list is called by sort_item() in the respective step of its pipeline. If invoked, its output is returned from sort_item() immediately, bypassing composite confidence check altogether.
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 8 — EDGE-CASE HANDLERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -945,6 +1056,22 @@ def _handle_conflicting_criteria(
         condition=FoodCondition.CRITICAL,   # conflicting signals → treat as critical until inspected
         warnings=warnings,
     )
+
+# COMMENTS-Section 9 — Core Sorting Pipeline Function (sort_item)
+# The one-and-only function that hardware integrators can call. Accepts a single food item, calls all other helpers in its 8-steps pipeline, and returns a SortDecision result.
+
+# Step 0 — resolves food type name string from FOOD_CATALOG into its canonical form (all lowercase, whitespace stripped). If not present, calls _handle_unknown_food() and returns its output.
+# Step 1 — calls _score_perishability() to calculate remaining_percentage. If it is 0.0 or lower, the item is expired and must be routed to reject chute. Calls _handle_expired_item() and exits.
+# Step 2 — calls _score_temperature() to validate temperature reading. If it is fully unsafe, calls _handle_unsafe_temperature() and exits.
+# Step 3 — calls _score_regional(). No early exit possible here, only generates warnings.
+# Step 4 — calls _select_bin() to choose the destination. Fallback: if the profile does not have bins, calls _handle_conflicting_criteria() and exits.
+# Step 5 — calls _select_action() to choose hardware command.
+# Step 6 — calculates composite confidence as weighted average: temperature 35%, destination 30%, perishability 20%, regional 15%. Combined with bin confidence.
+# Step 7 — if composite confidence < 0.40, calls _handle_conflicting_criteria() and exits.
+# Step 8 — calculates item's condition label using assess_food_condition() and assembles SortDecision from the collected information, logging it. Returns output.
+
+# Feeds into: called once per item inside sort_batch() (Section 10). In turn, the __main__ code path (Section 14) invokes sort_batch().
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1088,6 +1215,15 @@ def sort_item(sample: FoodSample) -> SortDecision:
     )
 
 
+# COMMENTS-Section 10 — Batch Sort Utility (sort_batch)
+# This single function sorts a batch of food samples. Used when several items are processed simultaneously after resolving jam/unloading pallet.
+
+# Calls sort_item() for every sample in the input list and gathers the resulting decisions. Orders them by priority descending (higher perishability comes first) for faster processing in execute_decision(). 
+# The built-in sort function in Python is stable, so items with equal priority retain their original intake order (FIFO per priority level).
+
+#Feeds into: executed by the __main__ function (Section 14). Its output is fed into execute_decision() (Section 11) and print_dashboard() (Section 13).
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 10 — BATCH SORT UTILITY
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1111,6 +1247,22 @@ def sort_batch(samples: list[FoodSample]) -> list[SortDecision]:
     # Python's sort is stable — equal-priority items keep their intake order,
     # which is correct (FIFO within the same urgency tier).
     return sorted(decisions, key=lambda d: d.priority, reverse=True)
+
+
+# COMMENTS-Section 11 — Simulated Hardware Driver Layer
+# These four driver functions would normally communicate with hardware using serial interface, CAN bus, PLC controller, etc. Currently, each prints what it would be doing and simulates actual actuation delay with time.sleep().
+
+# driver_divert_lane(decision) — simulated 50 ms pneumatic gate pulse.
+# driver_conveyor_stop(decision) — simulated 80 ms ramp-down of the motor.
+# driver_robotic_arm(decision) — simulated 120 ms robot pick-and-place cycle.
+# driver_reject_chute(decision) — simulated 60 ms solenoid open-close cycle.
+
+# ACTION_DRIVERS is a driver dispatch table — a regular Python dictionary with the action enum value as the key and the driver function as the value. 
+# When expanding the system with additional actions, it is enough to write a new driver function and register its entry in the table. sort_item() and execute_decision() require no changes.
+# execute_decision(decision) queries ACTION_DRIVERS table and calls the correct driver.
+
+# Feeds into: called by execute_decision() (Section 11) as part of the hardware execution loop in the __main__ code (Section 14).
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1201,6 +1353,16 @@ def execute_decision(decision: SortDecision) -> None:
         logger.error("No driver found for action '%s' (item %s)", decision.action, decision.item_id)
         return
     driver_fn(decision)
+
+
+# COMMENTS-Section 12 - Simulated Sensor / Conveyor Feed
+# Three simulated functions which emulate the capabilities of actual hardware sensors used during production.
+# simulate_ir_sensor(profile, scenario) creates an artificial IR temperature reading by calculating the midpoint of the temperature range for the food and adding noise (+/-0.5 °C). 
+# The scenario determines one of four possible outcomes; "normal" (midpoint + noise), "borderline" (±1.5 °C of upper limit), "unsafe" (8–15 °C above upper limit), and "frozen" (5–10 °C below lower limit).
+# simulate_harvest_hours(profile, freshness) creates an artificial elapsed-time reading by calculating a fraction of shelf_life_hours. 
+# "fresh" is 10–25% consumption, "aging" is 50–70%, "expiring" is 85-95%, and "expired" is 110–130% of the upper limit.
+# generate_sample_batch(region) constructs the complete 12-item test batch which exercises all possible conditions; normal food sorts, borderline temperature reading, unsafe temperature reading, expired food item, near expiration, and unknown food item.
+# Inputs into: generate_sample_batch() is called from the __main__ block (Section 14) to create the batch that sort_batch() will process.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1309,6 +1471,16 @@ def generate_sample_batch(region: Region = Region.TEMPERATE) -> list[FoodSample]
     samples.append(FoodSample("dragon_fruit", 18.0, region, 10.0, f"ITM-{item_count:04d}"))
 
     return samples
+
+
+# COMMENTS-Section 13 – Dashboard / Summary Printer (print_dashboard)
+# Formates and prints three panels to the terminal after a batch of food is sorted.
+# Results Sort Panel – one block per item (prioritised sorted in the order in which they were sorted), containing: condition symbol and its level, destination bin, hardware action, priority, a bar chart (of 20 blocks wide) representing confidence, reason string and warnings.
+# Summary Batch Panel – provides the totals for: total number sorted, total sorted %, reject for food safety %, quarantine %, and the average confidence for the batch. 
+# Additionally, it prints the Bin Fill report, displaying the number of food items that were sorted into each bin using a proportional bar.
+# Food Condition Report Panel – classifies all items in the batch based on the severity of the Food Condition level (from GOOD to BAD), printing: total items of this category (% of the batch), recommended operator handling action (using CONDITION_ACTIONS dictionary), and the item IDs and food names at this level (word wrapped up to 72 characters). 
+# The function uses a nested helper function _food_name() to safely extract the food type name from the reason string in the decision object, even for the special unknown food type messages.
+# Feed from: called once by the __main__ block (Section 14) after executing all hardware actions.
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1467,6 +1639,18 @@ def print_dashboard(decisions: list[SortDecision]) -> None:
             print(line_buf)
 
     print(f"\n{LINE}\n")
+
+
+# COMMENTS-Section 14 - Entry Point
+# Entry point for the script, runs only when the file is executed as python food_sorter_prototype.py. Does the following in sequence:
+
+# Ensures random.seed(42) is fixed to guarantee repeatable sensor output in case of demonstrations or debugging.
+# generate_sample_batch(region=Region.TEMPERATE) creates a sample batch of 12 objects that hit all code paths.
+# sort_batch(batch) applies all objects to the decision engine, producing a list of decisions ordered by priority.
+# Loops over the decisions returned from the previous step, displays routing context for each item and executes execute_decision(decision).
+# Finally calls print_dashboard(decisions) to generate full terminal dashboard.
+
+# Calling flow: generate_sample_batch() -> sort_batch() -> execute_decision() -> print_dashboard().
 
 
 # ─────────────────────────────────────────────────────────────────────────────
